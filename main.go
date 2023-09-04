@@ -2,51 +2,51 @@ package main
 
 import (
 	"context"
+	"demo/mpkg"
 	"encoding/json"
-	"fmt"
 	"log"
 	"math/rand"
-	"mpkg"
 	"os"
 	"strings"
 	"time"
-	"unicode/utf8"
 
-	"github.com/tencent-connect/botgo"
 	yaml "gopkg.in/yaml.v2"
 )
 
-// Config 定义了配置文件的结构
-type Config struct {
-	AppID uint64 `yaml:"appid"` //机器人的appid
-	Token string `yaml:"token"` //机器人的token
-}
-
-type idiomData struct {
-	Word        string `json:"word"`
-	Derivation  string `json:"derivation"`
-	Explanation string `json:"explanation"`
-	Pinyin      string `json:"pinyin"`
-}
-
-var config Config
-var idioms []idiomData
-var ctx context.Context
-var gameIsRunning bool = false
-var firstWord string = ""
-var lastWord string = ""
-
-type idiomsMap map[string]([]*idiomData)
+// 根据成语首字母建立哈希表，所有首字母相同的成语存储在一个列表中
+type idiomsMap map[string]([]*mpkg.IdiomData)
 type idiomsSet map[string]bool
+type idiomsToPtr map[string]*mpkg.IdiomData
 type idiomCount map[string]int
 
-var idiomsIndex idiomsMap
-var isSame idiomsSet
-var idiomDatabase idiomsSet
-var idiomCnt idiomCount
+var config mpkg.Config
+var ctx context.Context
+
+// 接龙游戏的定时timer
 var tm *time.Timer
 
-// 第一步： 获取机器人的配置信息，即机器人的appid和token
+// 存放成语的列表，索引结构中存放的是指针
+var idioms []mpkg.IdiomData
+
+// 游戏状态标志位，表示游戏是否在进行中
+var gameIsRunning bool = false
+
+// 目前成语的最后一个字，也就是下一个成语应该出现的第一个字
+var lastWord string = ""
+
+// 成语索引哈希表
+var idiomsIndex idiomsMap
+
+// 记录成语以识别是否出现过
+var isSame idiomsSet
+
+// 全量成语的set,用来快速找到指定成语
+var idiomDatabase idiomsToPtr
+
+// 纪录每个列表中还剩多少没出现过的成语，以判断是否应该结束游戏
+var idiomCnt idiomCount
+
+// 获取机器人的配置信息和初始化成语词库
 func init() {
 	content, err := os.ReadFile("config.yaml")
 	if err != nil {
@@ -76,32 +76,23 @@ func init() {
 		os.Exit(1)
 	}
 	idiomsIndex = make(idiomsMap)
-	idiomDatabase = make(idiomsSet)
+	idiomDatabase = make(idiomsToPtr)
 	// 给成语库建立索引
 	for i, _ := range idioms {
-		firstChar := getFirstChineseChar(idioms[i].Word)
+		firstChar := mpkg.GetFirstChineseChar(idioms[i].Word)
 		idiomsIndex[firstChar] = append(idiomsIndex[firstChar], &idioms[i])
-		idiomDatabase[idioms[i].Word] = true
+		idiomDatabase[idioms[i].Word] = &(idioms[i])
 	}
 	log.Println("成语库加载成功")
 }
 
-func main() {
-	// //第二步：生成token，用于校验机器人的身份信息
-	token := &mpkg.Token{
-		AppID:       config.AppID,
-		AccessToken: config.Token,
-		Type:        "Bot",
-	}
-	// //第三步：获取操作机器人的API对象
-	// api = botgo.NewOpenAPI(token).WithTimeout(3 * time.Second)
-	// 第四步：获取websocket
-	// ws, err := api.WS(ctx, nil, "")
+var m_client *mpkg.Client_struct
 
+func main() {
 	// 获取context
 	ctx = context.Background()
 	// 初始化http连接
-	m_client := mpkg.NewClient(config.AppID, config.Token, 3*time.Second)
+	m_client = mpkg.NewClient(config.AppID, config.Token, 3*time.Second)
 	// 通过http获取webSocket连接地址
 	ws, err := m_client.GetWSS(ctx)
 	if err != nil {
@@ -110,17 +101,16 @@ func main() {
 	} else {
 		log.Printf("%+v, err:%v", ws, err)
 	}
-
+	// 注册@消息的回调函数
 	var atMessage mpkg.ATMessageEventHandler = atMessageEventHandler
-	println(atMessage)
-	intent := mpkg.RegisterHandlers(atMessage) // 注册socket消息处理
-	fmt.Println(intent)
-	botgo.NewSessionManager().Start(ws, token, &intent) // 启动socket监听
+	intent := mpkg.RegisterHandlers(atMessage)                                                                            // 注册socket消息处理
+	mpkg.NewSessionManager().Start(ws, &mpkg.Token{AppID: config.AppID, AccessToken: config.Token, Type: "Bot"}, &intent) // 启动socket监听
 }
 
-// atMessageEventHandler 处理 @机器人 的消息
+// 处理 @机器人消息的回调函数
 func atMessageEventHandler(event *mpkg.WSPayload, data *mpkg.Message) error {
 	if gameIsRunning {
+		// 收到消息就刷新timer
 		tm.Reset(60 * time.Second)
 	}
 	message_content := data.Content[strings.Index(data.Content, ">")+2:]
@@ -141,12 +131,27 @@ func atMessageEventHandler(event *mpkg.WSPayload, data *mpkg.Message) error {
 	} else if gameIsRunning && message_content == "/认输" {
 		//直接重置timer时间，让timer快点触发
 		tm.Reset(time.Microsecond)
-	} else if gameIsRunning && isFourChineseCharacters(message_content) {
+	} else if strings.HasPrefix(message_content, "/解释成语") {
+		exp_idiom := message_content[strings.Index(message_content, " "):]
+		if len(exp_idiom) > 1 && mpkg.IsFourChineseCharacters(exp_idiom[1:]) {
+			_, yes := idiomDatabase[exp_idiom[1:]]
+			if yes {
+				to_exp_idiom := idiomDatabase[exp_idiom[1:]]
+				// out_content := to_exp_idiom.Word + ": " + to_exp_idiom.Pinyin + "\n出处：" + to_exp_idiom.Derivation + ":\n解释：" + to_exp_idiom.Explanation
+				m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Ark: mpkg.ArkMessage(to_exp_idiom)})
+			} else {
+				m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Content: "我也不认识。"})
+			}
+		} else {
+			println(exp_idiom[1:])
+			m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Content: "请输入正确的四字成语！"})
+		}
+	} else if gameIsRunning && mpkg.IsFourChineseCharacters(message_content) {
 		//先判断是否是成语
 		_, yes := idiomDatabase[message_content]
 		if yes {
 			//如果是成语判断成语是不是符合要求，即第一个字是上一个成语的最后一个字
-			temp_firstWord := getFirstChineseChar(message_content)
+			temp_firstWord := mpkg.GetFirstChineseChar(message_content)
 			if lastWord != "" && temp_firstWord != lastWord {
 				//第一个字不符合要求
 				m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Content: "需要说一个第一个汉字为 \"" + lastWord + "\" 的成语!"})
@@ -160,7 +165,7 @@ func atMessageEventHandler(event *mpkg.WSPayload, data *mpkg.Message) error {
 					//是一个符合要求的成语
 					isSame[message_content] = true
 					idiomCnt[temp_firstWord]--
-					lastWord = getLastChineseChar(message_content)
+					lastWord = mpkg.GetLastChineseChar(message_content)
 					_, yes = idiomDatabase[message_content]
 					if yes && idiomCnt[lastWord] > 0 {
 						idiomCnt[lastWord]--
@@ -175,13 +180,12 @@ func atMessageEventHandler(event *mpkg.WSPayload, data *mpkg.Message) error {
 							_, t = isSame[new_idiom]
 						}
 						isSame[new_idiom] = true
-						lastWord = getLastChineseChar(new_idiom)
+						lastWord = mpkg.GetLastChineseChar(new_idiom)
 						m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Content: new_idiom})
 					} else {
 						//词库里已经没有最后一个字开头的成语了，认输！
 						m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Content: "太厉害啦！我找不到合适的成语接着往下玩了，拜了拜了！"})
 						gameIsRunning = false
-						firstWord = ""
 						lastWord = ""
 					}
 				}
@@ -190,7 +194,7 @@ func atMessageEventHandler(event *mpkg.WSPayload, data *mpkg.Message) error {
 			//输入的不是成语提示
 			m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Content: "这可能不是一个成语，请再重新说一个!"})
 		}
-	} else if gameIsRunning && !isFourChineseCharacters(message_content) {
+	} else if gameIsRunning && !mpkg.IsFourChineseCharacters(message_content) {
 		m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Content: "请告诉我一个四字的成语喔~"})
 	} else {
 		m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Content: "我是菜菜机器人，你可以跟我玩成语接龙游戏，也可以查成语。"})
@@ -198,33 +202,10 @@ func atMessageEventHandler(event *mpkg.WSPayload, data *mpkg.Message) error {
 	return nil
 }
 
-// 获取中文字符串的第一个字符
-func getFirstChineseChar(s string) string {
-	r, _ := utf8.DecodeRuneInString(s)
-	return string(r)
-}
-
-// 获取中文字符串的最后一个字符
-func getLastChineseChar(s string) string {
-	_, size := utf8.DecodeLastRuneInString(s)
-	return s[len(s)-size:]
-}
-
-func isFourChineseCharacters(s string) bool {
-	// 获取字符串的字节数
-	byteCount := len(s)
-
-	// 获取字符串的Unicode字符数
-	charCount := utf8.RuneCountInString(s)
-
-	// 判断字节数和字符数是否都为4
-	return byteCount == 12 && charCount == 4
-}
-
+// timer超时没响应自动结束游戏的回调函数
 func timeout_handle(timer *time.Timer, data *mpkg.Message) {
 	<-timer.C
 	gameIsRunning = false
-	firstWord = ""
 	lastWord = ""
 	m_client.PostMessage(ctx, data.ChannelID, &mpkg.MessageToCreate{MsgID: data.ID, Content: "欢迎下次继续挑战，本次成语接龙游戏已结束，再见！"})
 }

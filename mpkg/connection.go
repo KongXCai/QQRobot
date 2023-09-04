@@ -7,20 +7,14 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"runtime"
 	"time"
 
 	"github.com/go-resty/resty/v2"
-	"github.com/tencent-connect/botgo/dto"
-	"github.com/tencent-connect/botgo/sessions/manager"
-	"github.com/tencent-connect/botgo/websocket"
 )
 
-var defaultSessionManager SessionManager = New()
-
 // NewSessionManager 获得 session manager 实例
-func NewSessionManager() SessionManager {
-	return defaultSessionManager
+func NewSessionManager() *ChanManager {
+	return New()
 }
 
 // WebsocketAP wss 接入点信息
@@ -50,9 +44,9 @@ func (client *Client_struct) GetWSS(ctx context.Context) (*WebsocketAP, error) {
 }
 
 // PostMessage 发消息
-func (client *client_struct) PostMessage(ctx context.Context, channelID string, msg *mpkg.MessageToCreate) (*mpkg.Message, error) {
+func (client *Client_struct) PostMessage(ctx context.Context, channelID string, msg *MessageToCreate) (*Message, error) {
 	resp, err := client.restyClient.R().SetContext(ctx).
-		SetResult(mpkg.Message{}).
+		SetResult(Message{}).
 		SetPathParam("channel_id", channelID).
 		SetBody(msg).
 		Post("https://api.sgroup.qq.com/channels/{channel_id}/messages")
@@ -60,13 +54,7 @@ func (client *client_struct) PostMessage(ctx context.Context, channelID string, 
 		return nil, err
 	}
 
-	return resp.Result().(*mpkg.Message), nil
-}
-
-// ShardConfig 连接的 shard 配置，ShardID 从 0 开始，ShardCount 最小为 1
-type ShardConfig struct {
-	ShardID    uint32
-	ShardCount uint32
+	return resp.Result().(*Message), nil
 }
 
 // Token 用于调用接口的 token 结构
@@ -76,14 +64,8 @@ type Token struct {
 	Type        string
 }
 
-// Session 连接的 session 结构，包括链接的所有必要字段
-type Session struct {
-	ID      string
-	URL     string
-	Token   Token
-	Intent  int
-	LastSeq uint32
-	Shards  ShardConfig
+func (tk *Token) ToStr() string {
+	return fmt.Sprintf("%v.%s", tk.AppID, tk.AccessToken)
 }
 
 // New 创建本地session管理器
@@ -94,12 +76,6 @@ func New() *ChanManager {
 // ChanManager 默认的本地 session manager 实现
 type ChanManager struct {
 	sessionChan chan Session
-}
-
-// SessionManager 接口，管理session
-type SessionManager interface {
-	// Start 启动连接，默认使用 apInfo 中的 shards 作为 shard 数量，如果有需要自己指定 shard 数，请修 apInfo 中的信息
-	Start(apInfo *WebsocketAP, token *Token, intents *int) error
 }
 
 // Start 启动本地 session manager
@@ -133,14 +109,14 @@ func (l *ChanManager) Start(apInfo *WebsocketAP, token *Token, intents *int) err
 }
 
 // concurrencyTimeWindowSec 并发时间窗口，单位秒
-const concurrencyTimeWindowSec = 2
+const CTW = 2
 
 // CalcInterval 根据并发要求，计算连接启动间隔
-func CalcInterval(maxConcurrency uint32) time.Duration {
-	if maxConcurrency == 0 {
-		maxConcurrency = 1
+func CalcInterval(maxC uint32) time.Duration {
+	if maxC == 0 {
+		maxC = 1
 	}
-	f := math.Round(concurrencyTimeWindowSec / float64(maxConcurrency))
+	f := math.Round(CTW / float64(maxC))
 	if f == 0 {
 		f = 1
 	}
@@ -203,20 +179,20 @@ func (l *ChanManager) newConnect(session Session) {
 	defer func() {
 		// panic 留下日志，放回 session
 		if err := recover(); err != nil {
-			websocket.PanicHandler(err, &session)
+			PanicHandler(err, &session)
 			l.sessionChan <- session
 		}
 	}()
-	wsClient := websocket.ClientImpl.New(session)
+	wsClient := NewWebsocket(session)
 	if err := wsClient.Connect(); err != nil {
 		log.Println(err)
 		l.sessionChan <- session // 连接失败，丢回去队列排队重连
 		return
 	}
 	var err error
-	// 如果 session id 不为空，则执行的是 resume 操作，如果为空，则执行的是 identify 操作
+	// 重连或者鉴权
 	if session.ID != "" {
-		err = wsClient.Resume()
+		err = wsClient.ReTry()
 	} else {
 		// 初次鉴权
 		err = wsClient.Identify()
@@ -227,27 +203,8 @@ func (l *ChanManager) newConnect(session Session) {
 	}
 	if err := wsClient.Listening(); err != nil {
 		log.Printf("[ws/session] Listening err %+v", err)
-		currentSession := wsClient.Session()
-		// 对于不能够进行重连的session，需要清空 session id 与 seq
-		if manager.CanNotResume(err) {
-			currentSession.ID = ""
-			currentSession.LastSeq = 0
-		}
-		// 一些错误不能够鉴权，比如机器人被封禁，这里就直接退出了
-		if manager.CanNotIdentify(err) {
-			msg := fmt.Sprintf("can not identify because server return %+v, so process exit", err)
-			log.Printf(msg)
-			panic(msg) // 当机器人被下架，或者封禁，将不能再连接，所以 panic
-		}
-		// 将 session 放到 session chan 中，用于启动新的连接，当前连接退出
+		currentSession := wsClient.GetSession()
 		l.sessionChan <- *currentSession
 		return
 	}
-}
-
-// PanicHandler 处理websocket场景的 panic ，打印堆栈
-func PanicHandler(e interface{}, session *dto.Session) {
-	buf := make([]byte, PanicBufLen)
-	buf = buf[:runtime.Stack(buf, false)]
-	log.Errorf("[PANIC]%s\n%v\n%s\n", session, e, buf)
 }
